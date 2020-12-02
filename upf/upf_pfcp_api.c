@@ -746,6 +746,44 @@ handle_f_teid (upf_session_t * sx, upf_main_t * gtm, pfcp_pdi_t * pdi,
 
 
 static int
+validate_ue_ip_and_teid (upf_session_t * sx, upf_nwi_t * nwi, pfcp_ue_ip_address_t * ue_addr, u32 teid)
+{
+  upf_main_t *gtm = &upf_main;
+  u32 session_index = ~0;
+
+  if (!nwi)
+    return 0;
+
+  if (ue_addr->flags & IE_UE_IP_ADDRESS_V4)
+    {
+      ip4_ue_index_key_t key4;
+      clib_bihash_kv_8_8_t kv, value;
+      key4.ip4 = ue_addr->ip4.as_u32;
+      key4.teid = clib_net_to_host_u32 (teid);
+      kv.key = key4.as_u64;
+      if (!clib_bihash_search_8_8 (&nwi->v4_ue_index, &kv, &value))
+        session_index = value.value;
+    }
+  else if (ue_addr->flags & IE_UE_IP_ADDRESS_V6)
+    {
+      clib_bihash_kv_24_8_t kv, value;
+
+      kv.key[0] = ue_addr->ip6.as_u64[0];
+      kv.key[1] = ue_addr->ip6.as_u64[1];
+      kv.key[2] = clib_net_to_host_u32 (teid);
+
+      if (!clib_bihash_search_24_8 (&nwi->v6_ue_index, &kv, &value))
+        session_index = value.value;
+    }
+
+  if (session_index != ~0 && session_index != sx - gtm->sessions)
+    return -1;
+
+  return 0;
+}
+
+
+static int
 handle_create_pdr (upf_session_t * sx, pfcp_create_pdr_t * create_pdr,
 		   struct pfcp_group *grp,
 		   pfcp_created_pdr_t ** created_pdr_vec,
@@ -773,6 +811,7 @@ handle_create_pdr (upf_session_t * sx, pfcp_create_pdr_t * create_pdr,
     upf_upip_res_t *res, *ip_res = NULL;
     upf_pdr_t *create;
     upf_nwi_t *nwi = NULL;
+    u32 teid = 0;
 
     vec_add2 (rules->pdr, create, 1);
     memset (create, 0, sizeof (*create));
@@ -826,6 +865,7 @@ handle_create_pdr (upf_session_t * sx, pfcp_create_pdr_t * create_pdr,
 		       pdr->pdr_id);
 	    break;
 	  }
+        teid = pdr->pdi.f_teid.teid;
 	/* TODO validate TEID and mask
 	   if (nwi->teid != (pdr->pdi.f_teid.teid & nwi->mask))
 	   {
@@ -940,6 +980,15 @@ handle_create_pdr (upf_session_t * sx, pfcp_create_pdr_t * create_pdr,
 	}
       }
 
+    if ((create->pdi.fields & F_PDI_UE_IP_ADDR) && nwi &&
+        validate_ue_ip_and_teid (sx, nwi, &create->pdi.ue_addr, teid))
+      {
+        r = -1;
+        // TODO: display UE IP + teid
+        upf_debug ("handle_create_pdr: duplicate UE IP+TEID");
+        break;
+      }
+
     // CREATE_PDR_ACTIVATE_PREDEFINED_RULES
   }
 
@@ -978,6 +1027,7 @@ handle_update_pdr (upf_session_t * sx, pfcp_update_pdr_t * update_pdr,
     upf_pdr_t *update;
     upf_upip_res_t *res, *ip_res = NULL;
     upf_nwi_t *nwi = NULL;
+    u32 teid;
 
     update = pfcp_get_pdr (sx, PFCP_PENDING, pdr->pdr_id);
     if (!update)
@@ -1030,6 +1080,9 @@ handle_update_pdr (upf_session_t * sx, pfcp_update_pdr_t * update_pdr,
 	    break;
 	  }
       }
+
+    if (update->pdi.fields & F_PDI_LOCAL_F_TEID)
+      teid = update->pdi.teid.teid;
 
     if (ISSET_BIT (pdr->pdi.grp.fields, PDI_UE_IP_ADDRESS))
       {
@@ -1136,6 +1189,15 @@ handle_update_pdr (upf_session_t * sx, pfcp_update_pdr_t * update_pdr,
 	{
 	  vec_add1 (update->qer_ids, *qer_id);
 	}
+      }
+
+    if ((update->pdi.fields & F_PDI_UE_IP_ADDR) && nwi &&
+        validate_ue_ip_and_teid (sx, nwi, &update->pdi.ue_addr, teid))
+      {
+        r = -1;
+        // TODO: display UE IP + teid
+        upf_debug ("handle_update_pdr: duplicate UE IP+TEID");
+        break;
       }
 
     // UPDATE_PDR_ACTIVATE_PREDEFINED_RULES

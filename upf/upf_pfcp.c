@@ -215,6 +215,17 @@ vnet_upf_create_nwi_if (u8 * name, u32 ip4_table_id, u32 ip6_table_id,
 
   hash_set_mem (gtm->nwi_index_by_name, nwi->name, if_index);
 
+  clib_bihash_init_8_8 (&nwi->v4_ue_index,
+			"upf_v4_tunnel_by_key", UPF_MAPPING_BUCKETS,
+			UPF_MAPPING_MEMORY_SIZE);
+  /* clib_bihash_set_kvp_format_fn_8_8 (&sm->v4_tunnel_by_key, */
+  /*       			     format_v4_tunnel_by_key_kvp); */
+  clib_bihash_init_24_8 (&nwi->v6_ue_index,
+			 "upf_v6_tunnel_by_key", UPF_MAPPING_BUCKETS,
+			 UPF_MAPPING_MEMORY_SIZE);
+  /* clib_bihash_set_kvp_format_fn_24_8 (&sm->v6_tunnel_by_key, */
+  /*       			      format_v6_tunnel_by_key_kvp); */
+
   if (sw_if_idx)
     *sw_if_idx = nwi->sw_if_index;
 
@@ -1151,13 +1162,16 @@ pfcp_send_end_marker (upf_session_t * sx, u16 far_id)
 }
 
 static int
-ip46_address_fib_cmp (const void *a0, const void *b0)
+ue_ip_cmp (const void *a0, const void *b0)
 {
-  const ip46_address_fib_t *a = a0;
-  const ip46_address_fib_t *b = b0;
+  const ue_ip_t *a = a0;
+  const ue_ip_t *b = b0;
   int r;
 
   if ((r = intcmp (a->fib_index, b->fib_index)) != 0)
+    return r;
+
+  if ((r = intcmp(a->teid, b->teid)) != 0)
     return r;
 
   return ip46_address_cmp (&a->addr, &b->addr);
@@ -1185,6 +1199,36 @@ upf_acl_cmp (const void *a, const void *b)
   return memcmp (a, b, offsetof (upf_acl_t, pdr_idx));
 }
 
+static void
+add_del_ue_index_entry (upf_session_t * sx, const ue_ip_t * ue_ip, int is_add)
+{
+  upf_main_t *gtm = &upf_main;
+  upf_nwi_t *nwi;
+
+  ASSERT (ue_ip->sw_if_index < vec_len(gtm->nwi_index_by_sw_if_index));
+  nwi = gtm->nwis + gtm->nwi_index_by_sw_if_index[ue_ip->sw_if_index];
+
+  if (ip46_address_is_ip4 (&ue_ip->addr))
+    {
+      ip4_ue_index_key_t key4;
+      clib_bihash_kv_8_8_t kv;
+      key4.ip4 = ue_ip->addr.ip4.as_u32;
+      key4.teid = clib_net_to_host_u32 (ue_ip->teid);
+      kv.key = key4.as_u64;
+      kv.value = sx - gtm->sessions;
+      clib_bihash_add_del_8_8 (&nwi->v4_ue_index, &kv, is_add);
+    }
+  else
+    {
+      clib_bihash_kv_24_8_t kv;
+      kv.key[0] = ue_ip->addr.ip6.as_u64[0];
+      kv.key[1] = ue_ip->addr.ip6.as_u64[1];
+      kv.key[2] = clib_net_to_host_u32 (ue_ip->teid);
+      kv.value = sx - gtm->sessions;
+      clib_bihash_add_del_24_8 (&nwi->v6_ue_index, &kv, is_add);
+    }
+}
+
 //TODO: instead of using the UE IP, we should use the DL SDF dst fields
 static void
 pfcp_add_del_ue_ip (const void *ip, void *si, int is_add)
@@ -1192,6 +1236,12 @@ pfcp_add_del_ue_ip (const void *ip, void *si, int is_add)
   const ue_ip_t *ue_ip = ip;
   upf_session_t *sx = si;
   fib_prefix_t pfx;
+
+  add_del_ue_index_entry (sx, ue_ip, is_add);
+
+  /* UE IPs with TEIDs don't need DPO */
+  if (ue_ip->teid != 0)
+    return;
 
   memset (&pfx, 0, sizeof (pfx));
 
@@ -1566,27 +1616,38 @@ rules_add_v6_teid (struct rules *r, const ip6_address_t * addr, u32 teid,
     e->rule_index = ~0;
 }
 
+typedef enum {
+  UE_IP_SRC,
+  UE_IP_DST,
+  UE_IP_ENCAPSULATED
+} ue_ip_kind_t;
+
 static void
 rules_add_ue_ip (struct rules *r, fib_protocol_t fproto,
-		 ue_ip_t * ue_ip, u8 is_dst)
+		 ue_ip_t * ue_ip, ue_ip_kind_t kind)
 {
   upf_main_t *gtm = &upf_main;
+  u32 fib_index;
 
-  if (is_dst)
+  switch (kind) {
+  case UE_IP_DST:
     vec_add1 (r->ue_dst_ip, *ue_ip);
-  else
-    {
-      u32 fib_index = ~0;
+    break;
+  case UE_IP_SRC:
+    fib_index = ~0;
 
-      if (ue_ip->fib_index < vec_len (gtm->tdf_ul_table[fproto]))
-	fib_index = vec_elt (gtm->tdf_ul_table[fproto], ue_ip->fib_index);
+    if (ue_ip->fib_index < vec_len (gtm->tdf_ul_table[fproto]))
+      fib_index = vec_elt (gtm->tdf_ul_table[fproto], ue_ip->fib_index);
 
-      if (~0 != fib_index)
-	{
-	  ue_ip->fib_index = fib_index;
-	  vec_add1 (r->ue_src_ip, *ue_ip);
-	}
-    }
+    if (~0 != fib_index)
+      {
+        ue_ip->fib_index = fib_index;
+        vec_add1 (r->ue_src_ip, *ue_ip);
+      }
+    break;
+  case UE_IP_ENCAPSULATED:
+    vec_add1(r->ue_ip_encapsulated, *ue_ip);
+  }
 }
 
 static int
@@ -1610,21 +1671,28 @@ build_pfcp_rules (upf_session_t * sx)
 	sw_if_index = nwi->sw_if_index;
       }
 
-    /* create UE IP route from SGi Network Instance into Session */
-
     /*
-     * From 3GPP TS 29.244 version 14.3.0, Table 7.5.2.2-2
-     *
-     * NOTE 2: When a Local F-TEID is provisioned in the PDI, the
-     *         Network Instance shall relate to the IP address of
-     *         the F-TEID. Otherwise, the Network Instance shall
-     *         relate to the UE IP address.
+     * Create UE IP route from SGi Network Instance into Session,
+     * and register UE IP with TEID (if any) to avoid conflicts
+     * with other sessions.
      */
-    if (!(pdr->pdi.fields & F_PDI_LOCAL_F_TEID) &&
-	pdr->pdi.fields & F_PDI_UE_IP_ADDR)
+
+    if (pdr->pdi.fields & F_PDI_UE_IP_ADDR)
       {
 	ue_ip_t ue_ip;
-	u8 is_dst = !!(pdr->pdi.ue_addr.flags & IE_UE_IP_ADDRESS_SD);
+	ue_ip_kind_t kind;
+
+	if (pdr->pdi.fields & F_PDI_LOCAL_F_TEID)
+	  {
+	    kind = UE_IP_ENCAPSULATED;
+	    ue_ip.teid = pdr->pdi.teid.teid;
+	  }
+	else
+	  {
+	    kind = pdr->pdi.ue_addr.flags & IE_UE_IP_ADDRESS_SD ?
+	      UE_IP_DST : UE_IP_SRC;
+	    ue_ip.teid = 0;
+	  }
 
 	if (pdr->pdi.ue_addr.flags & IE_UE_IP_ADDRESS_V4)
 	  {
@@ -1635,7 +1703,7 @@ build_pfcp_rules (upf_session_t * sx)
 
 	    upf_debug ("UP FIB Idx %u, sw_if_index %u",
 		       ue_ip.fib_index, ue_ip.sw_if_index);
-	    rules_add_ue_ip (pending, FIB_PROTOCOL_IP4, &ue_ip, is_dst);
+	    rules_add_ue_ip (pending, FIB_PROTOCOL_IP4, &ue_ip, kind);
 	  }
 
 	if (pdr->pdi.ue_addr.flags & IE_UE_IP_ADDRESS_V6)
@@ -1645,7 +1713,7 @@ build_pfcp_rules (upf_session_t * sx)
 	      upf_fib_index_by_sw_if_index (sw_if_index, 0 /* is_ip4 */ );
 	    ue_ip.sw_if_index = sw_if_index;
 
-	    rules_add_ue_ip (pending, FIB_PROTOCOL_IP6, &ue_ip, is_dst);
+	    rules_add_ue_ip (pending, FIB_PROTOCOL_IP6, &ue_ip, kind);
 	  }
       }
 
@@ -1855,7 +1923,7 @@ pfcp_update_apply (upf_session_t * sx)
       sx->flags |= PFCP_UPDATING;
 
       /* update UE addresses and TEIDs */
-      vec_diff (pending->ue_dst_ip, active->ue_dst_ip, ip46_address_fib_cmp,
+      vec_diff (pending->ue_dst_ip, active->ue_dst_ip, ue_ip_cmp,
 		pfcp_add_del_ue_ip, sx);
       vec_diff (pending->v4_teid, active->v4_teid, v4_teid_cmp,
 		pfcp_add_del_v4_teid, sx);
@@ -1868,8 +1936,10 @@ pfcp_update_apply (upf_session_t * sx)
       upf_debug ("v4 ACLs %u\n", pending->v4_acls);
       upf_debug ("v6 ACLs %u\n", pending->v6_acls);
 
-      vec_diff (pending->ue_src_ip, active->ue_src_ip, ip46_address_fib_cmp,
+      vec_diff (pending->ue_src_ip, active->ue_src_ip, ue_ip_cmp,
 		pfcp_add_del_ue_ip, sx);
+      vec_diff (pending->ue_ip_encapsulated, active->ue_ip_encapsulated, ue_ip_cmp,
+        	pfcp_add_del_ue_ip, sx);
 
       /* has PDRs but no TEIDs or UE IPs, add to global wildcard TDF table */
       vec_diff (pending->v4_acls, active->v4_acls, upf_acl_cmp,

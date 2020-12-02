@@ -572,6 +572,7 @@ typedef struct
   ip46_address_t addr;
   u32 fib_index;
   u32 sw_if_index;
+  u32 teid;
 } ue_ip_t;
 
 typedef struct
@@ -620,6 +621,7 @@ typedef struct
 
     ue_ip_t *ue_src_ip;
     ue_ip_t *ue_dst_ip;
+    ue_ip_t *ue_ip_encapsulated;
     gtpu4_endp_rule_t *v4_teid;
     gtpu6_endp_rule_t *v6_teid;
 
@@ -703,6 +705,9 @@ typedef struct
   /* vnet intfc index */
   u32 sw_if_index;
   u32 hw_if_index;
+
+  clib_bihash_8_8_t v4_ue_index;
+  clib_bihash_24_8_t v6_ue_index;
 } upf_nwi_t;
 
 typedef struct
@@ -865,6 +870,23 @@ typedef struct
   u32 session_index;
   u32 teid;
 } upf_encap_trace_t;
+
+/* *INDENT-OFF* */
+typedef CLIB_PACKED
+(struct {
+  /*
+   * Key fields: UE IP and gtpu teid on the gtpu packet
+   * all fields in NET byte order
+   */
+  union {
+    struct {
+      u32 ip4;
+      u32 teid;
+    };
+    u64 as_u64;
+  };
+}) ip4_ue_index_key_t;
+/* *INDENT-ON* */
 
 u8 *format_upf_encap_trace (u8 * s, va_list * args);
 u32 upf_gtpu_end_marker (u32 fib_index, u32 dpoi_index, u8 * rewrite,
